@@ -1,0 +1,10 @@
+{
+  "name": "Blip",
+  "short_name": "Blip",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#111111",
+  "description": "Offline phone-to-phone chat over WiFi or hotspot. No internet needed.",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
