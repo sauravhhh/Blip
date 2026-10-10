@@ -23,23 +23,36 @@ import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 /**
- * Blip — offline Bluetooth text chat between two phones.
- * One phone taps Host (becomes discoverable), the other taps Scan
- * and taps the device. No internet needed.
+ * Blip — offline Bluetooth mesh chat between phones.
+ *
+ * Every phone can connect to several others at once. Each message
+ * carries a unique id and a hop limit (TTL); a phone that receives
+ * a message it hasn't seen relays it to all its other peers.
+ * Messages therefore hop phone-to-phone across the mesh, reaching
+ * devices beyond direct Bluetooth range. No internet needed.
  */
 public class MainActivity extends Activity {
 
     private static final UUID APP_UUID =
             UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final String SERVICE_NAME = "BlipChat";
+    private static final int MESH_TTL = 5;
+    private static final int MAX_SEEN = 500;
     private static final int REQ_ENABLE_BT = 1;
     private static final int REQ_PERMS = 2;
     private static final int REQ_DISCOVERABLE = 300;
@@ -52,11 +65,15 @@ public class MainActivity extends Activity {
     private final ArrayList<BluetoothDevice> devices = new ArrayList<BluetoothDevice>();
     private final ArrayList<String> deviceNames = new ArrayList<String>();
     private final ArrayList<String> messages = new ArrayList<String>();
+    private final Set<String> bondedAddrs = new HashSet<String>();
+
+    // mesh state
+    private final Map<String, ConnectedThread> peers = new HashMap<String, ConnectedThread>();
+    private final Map<String, String> peerNames = new HashMap<String, String>();
+    private final LinkedHashSet<String> seenIds = new LinkedHashSet<String>();
 
     private AcceptThread acceptThread;
     private ConnectThread connectThread;
-    private ConnectedThread connectedThread;
-    private BluetoothDevice connectedDevice;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
@@ -64,16 +81,22 @@ public class MainActivity extends Activity {
             String a = intent.getAction();
             if (BluetoothDevice.ACTION_FOUND.equals(a)) {
                 BluetoothDevice d = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                if (d != null && !devices.contains(d)) {
+                if (d != null && !containsDevice(d.getAddress())) {
                     devices.add(d);
-                    deviceNames.add(label(d));
-                    deviceAdapter.notifyDataSetChanged();
+                    refreshDeviceList();
                 }
             } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(a)) {
-                setStatus("Scan finished. Tap a device to connect.");
+                setStatus("Scan finished. Tap a device to connect — you can connect to several.");
             }
         }
     };
+
+    private boolean containsDevice(String addr) {
+        for (BluetoothDevice d : devices) {
+            if (addr.equals(d.getAddress())) return true;
+        }
+        return false;
+    }
 
     @Override
     protected void onCreate(Bundle b) {
@@ -181,7 +204,7 @@ public class MainActivity extends Activity {
     }
 
     private void onBtReady() {
-        setStatus("Bluetooth on. One phone taps Host, the other taps Scan.");
+        updateMeshStatus();
         loadBonded();
         listen();
     }
@@ -197,11 +220,15 @@ public class MainActivity extends Activity {
         setStatus("Hosting — this phone is visible for 5 minutes.");
     }
 
-    private void listen() {
-        if (acceptThread == null && connectedThread == null) {
+    private synchronized void listen() {
+        if (acceptThread == null) {
             acceptThread = new AcceptThread();
             acceptThread.start();
         }
+    }
+
+    private synchronized void clearAccept(AcceptThread t) {
+        if (acceptThread == t) acceptThread = null;
     }
 
     private void startScan() {
@@ -217,56 +244,97 @@ public class MainActivity extends Activity {
 
     private void loadBonded() {
         devices.clear();
-        deviceNames.clear();
+        bondedAddrs.clear();
         try {
             Set<BluetoothDevice> bonded = bt.getBondedDevices();
             if (bonded != null) {
                 for (BluetoothDevice d : bonded) {
                     devices.add(d);
-                    deviceNames.add(label(d) + " (paired)");
+                    bondedAddrs.add(d.getAddress());
                 }
             }
         } catch (SecurityException e) { /* perms checked */ }
-        deviceAdapter.notifyDataSetChanged();
+        refreshDeviceList();
     }
 
-    private String label(BluetoothDevice d) {
+    private void refreshDeviceList() {
+        deviceNames.clear();
+        for (BluetoothDevice d : devices) {
+            String n = label(d);
+            String a = d.getAddress();
+            synchronized (this) {
+                if (peers.containsKey(a)) n += " (connected)";
+                else if (bondedAddrs.contains(a)) n += " (paired)";
+            }
+            deviceNames.add(n);
+        }
+        final ArrayAdapter<String> ad = deviceAdapter;
+        runOnUiThread(new Runnable() {
+            @Override public void run() { ad.notifyDataSetChanged(); }
+        });
+    }
+
+    private String shortName(BluetoothDevice d) {
         String n;
         try { n = d.getName(); }
         catch (SecurityException e) { n = null; }
         if (n == null || n.isEmpty()) n = "Unknown device";
-        return n + "\n" + d.getAddress();
+        return n;
     }
 
-    // ---------- connection ----------
+    private String label(BluetoothDevice d) {
+        return shortName(d) + "\n" + d.getAddress();
+    }
+
+    private String myName() {
+        try {
+            String n = bt.getName();
+            return (n != null && !n.isEmpty()) ? n : "Me";
+        } catch (SecurityException e) {
+            return "Me";
+        }
+    }
+
+    // ---------- mesh connections ----------
 
     private void connectTo(BluetoothDevice d) {
-        if (connectedThread != null) disconnect();
-        if (connectThread != null) { connectThread.cancel(); connectThread = null; }
+        final String addr = d.getAddress();
+        synchronized (this) {
+            if (peers.containsKey(addr)) {
+                disconnectPeer(addr); // tap again to drop that peer
+                return;
+            }
+            if (connectThread != null) { connectThread.cancel(); connectThread = null; }
+        }
         try { bt.cancelDiscovery(); } catch (SecurityException e) { /* perms checked */ }
-        setStatus("Connecting to " + label(d).replace("\n", " ") + "…");
+        setStatus("Connecting to " + shortName(d) + "…");
         connectThread = new ConnectThread(d);
         connectThread.start();
     }
 
-    private synchronized void onConnected(BluetoothSocket s, BluetoothDevice d) {
-        connectThread = null;
-        if (acceptThread != null) { acceptThread.cancel(); acceptThread = null; }
-        if (connectedThread != null) connectedThread.cancel();
-        connectedThread = new ConnectedThread(s);
-        connectedThread.start();
-        connectedDevice = d;
-        final String name = label(d).replace("\n", " ");
+    private synchronized void onPeerConnected(BluetoothSocket s, BluetoothDevice d) {
+        final String addr = d.getAddress();
+        if (peers.containsKey(addr)) {
+            // duplicate link (both sides dialled at once) — keep the first
+            try { s.close(); } catch (IOException e) { /* done */ }
+            return;
+        }
+        final String name = shortName(d);
+        ConnectedThread t = new ConnectedThread(s, addr);
+        peers.put(addr, t);
+        peerNames.put(addr, name);
+        t.start();
         runOnUiThread(new Runnable() {
             @Override public void run() {
-                setStatus("Connected to " + name);
-                addMsg("— Connected —");
+                addMsg("— " + name + " joined the mesh —");
+                updateMeshStatus();
+                refreshDeviceList();
             }
         });
     }
 
     private void onConnectFailed() {
-        connectThread = null;
+        synchronized (this) { connectThread = null; }
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 setStatus("Could not connect. Make sure the other phone tapped Host, then try again.");
@@ -274,43 +342,125 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void onDisconnected() {
-        connectedThread = null;
-        connectedDevice = null;
+    private void onPeerLost(final String addr) {
+        final String name;
+        synchronized (this) {
+            if (!peers.containsKey(addr) && !peerNames.containsKey(addr)) return;
+            name = peerNames.remove(addr);
+            peers.remove(addr);
+        }
         runOnUiThread(new Runnable() {
             @Override public void run() {
-                setStatus("Disconnected.");
-                addMsg("— Disconnected —");
+                if (name != null) addMsg("— " + name + " left —");
+                updateMeshStatus();
+                refreshDeviceList();
+                listen();
             }
         });
-        listen();
     }
 
-    private void disconnect() {
-        if (connectThread != null) { connectThread.cancel(); connectThread = null; }
-        if (connectedThread != null) { connectedThread.cancel(); connectedThread = null; }
-        connectedDevice = null;
-        setStatus("Disconnected.");
-        listen();
+    private void disconnectPeer(String addr) {
+        ConnectedThread t;
+        synchronized (this) {
+            t = peers.remove(addr);
+            peerNames.remove(addr);
+        }
+        if (t != null) t.cancel();
+        updateMeshStatus();
+        refreshDeviceList();
     }
 
-    // ---------- chat ----------
+    private void updateMeshStatus() {
+        final int n;
+        synchronized (this) { n = peers.size(); }
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                if (n == 0) {
+                    setStatus("Mesh: no connections. One phone taps Host, others tap Scan.");
+                } else {
+                    setStatus("Mesh: " + n + " connected — messages hop across phones.");
+                }
+            }
+        });
+    }
+
+    // ---------- mesh messaging ----------
+
+    private void broadcast(String text) {
+        String id = UUID.randomUUID().toString();
+        JSONObject o = new JSONObject();
+        try {
+            o.put("i", id);
+            o.put("t", MESH_TTL);
+            o.put("f", myName());
+            o.put("m", text);
+        } catch (JSONException e) {
+            return;
+        }
+        String line = o.toString();
+        synchronized (this) {
+            seenIds.add(id);
+            trimSeen();
+            for (ConnectedThread t : peers.values()) t.write(line);
+        }
+        onMessage("Me", text, true);
+    }
+
+    private void onMeshLine(String line, String viaAddr) {
+        try {
+            JSONObject o = new JSONObject(line);
+            String id = o.getString("i");
+            synchronized (this) {
+                if (seenIds.contains(id)) return; // already relayed
+                seenIds.add(id);
+                trimSeen();
+            }
+            String from = o.optString("f", "Someone");
+            String text = o.getString("m");
+            int ttl = o.optInt("t", MESH_TTL);
+            onMessage(from, text, false);
+            if (ttl > 1) {
+                o.put("t", ttl - 1);
+                String fwd = o.toString();
+                synchronized (this) {
+                    for (Map.Entry<String, ConnectedThread> e : peers.entrySet()) {
+                        if (!e.getKey().equals(viaAddr)) e.getValue().write(fwd);
+                    }
+                }
+            }
+        } catch (JSONException e) {
+            // plain-text peer (Blip v1.0): display only, no relay
+            onMessage("Them", line, false);
+        }
+    }
+
+    private void trimSeen() {
+        while (seenIds.size() > MAX_SEEN) {
+            String first = seenIds.iterator().next();
+            seenIds.remove(first);
+        }
+    }
+
+    // ---------- chat ui ----------
 
     private void sendMessage() {
         String t = input.getText().toString().trim();
         if (t.isEmpty()) return;
-        if (connectedThread == null) {
-            toast("Not connected to anyone yet.");
-            return;
+        synchronized (this) {
+            if (peers.isEmpty()) {
+                toast("No connections yet — connect to a phone first.");
+                return;
+            }
         }
-        connectedThread.write(t);
+        broadcast(t);
         input.setText("");
-        onMessage(t, true);
     }
 
-    private void onMessage(final String text, final boolean mine) {
+    private void onMessage(final String from, final String text, final boolean mine) {
         runOnUiThread(new Runnable() {
-            @Override public void run() { addMsg((mine ? "Me: " : "Them: ") + text); }
+            @Override public void run() {
+                addMsg((mine ? "Me" : from) + ": " + text);
+            }
         });
     }
 
@@ -333,17 +483,20 @@ public class MainActivity extends Activity {
             } catch (IOException e) { server = null; }
         }
         @Override public void run() {
-            if (server == null) return;
+            BluetoothServerSocket srv = server;
+            if (srv == null) { clearAccept(this); return; }
             while (true) {
                 BluetoothSocket s;
-                try { s = server.accept(); }
+                try { s = srv.accept(); }
                 catch (IOException e) { break; }
                 if (s != null) {
-                    onConnected(s, s.getRemoteDevice());
-                    try { server.close(); } catch (IOException e) { /* done */ }
-                    break;
+                    BluetoothDevice d = null;
+                    try { d = s.getRemoteDevice(); } catch (Exception e) { /* ignore */ }
+                    if (d != null) onPeerConnected(s, d);
+                    else { try { s.close(); } catch (IOException e) { /* done */ } }
                 }
             }
+            clearAccept(this);
         }
         void cancel() {
             try { if (server != null) server.close(); } catch (IOException e) { /* done */ }
@@ -366,7 +519,10 @@ public class MainActivity extends Activity {
                 try { sock.close(); } catch (IOException e2) { /* done */ }
                 return;
             }
-            onConnected(sock, dev);
+            synchronized (MainActivity.this) {
+                if (connectThread == this) connectThread = null;
+            }
+            onPeerConnected(sock, dev);
         }
         void cancel() {
             try { if (sock != null) sock.close(); } catch (IOException e) { /* done */ }
@@ -375,33 +531,36 @@ public class MainActivity extends Activity {
 
     private class ConnectedThread extends Thread {
         private final BluetoothSocket sock;
+        private final String addr;
         private InputStream in;
         private OutputStream out;
-        ConnectedThread(BluetoothSocket s) {
+        ConnectedThread(BluetoothSocket s, String a) {
             sock = s;
+            addr = a;
             try {
                 in = s.getInputStream();
                 out = s.getOutputStream();
             } catch (IOException e) { in = null; out = null; }
         }
         @Override public void run() {
-            if (in == null) { onDisconnected(); return; }
+            if (in == null) { onPeerLost(addr); return; }
             byte[] buf = new byte[4096];
             StringBuilder sb = new StringBuilder();
             while (true) {
                 int n;
                 try { n = in.read(buf); }
-                catch (IOException e) { onDisconnected(); break; }
-                if (n <= 0) { onDisconnected(); break; }
+                catch (IOException e) { break; }
+                if (n <= 0) break;
                 try { sb.append(new String(buf, 0, n, "UTF-8")); }
                 catch (Exception e) { /* keep going */ }
                 int idx;
                 while ((idx = sb.indexOf("\n")) >= 0) {
                     String line = sb.substring(0, idx);
                     sb.delete(0, idx + 1);
-                    if (!line.isEmpty()) onMessage(line, false);
+                    if (!line.isEmpty()) onMeshLine(line, addr);
                 }
             }
+            onPeerLost(addr);
         }
         void write(String msg) {
             try {
@@ -409,7 +568,7 @@ public class MainActivity extends Activity {
                     out.write((msg + "\n").getBytes("UTF-8"));
                     out.flush();
                 }
-            } catch (IOException e) { /* connection likely dead */ }
+            } catch (IOException e) { /* peer likely gone */ }
         }
         void cancel() {
             try { sock.close(); } catch (IOException e) { /* done */ }
@@ -420,9 +579,14 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         try { unregisterReceiver(receiver); } catch (IllegalArgumentException e) { /* done */ }
-        try { if (bt.isDiscovering()) bt.cancelDiscovery(); } catch (Exception e) { /* done */ }
-        if (acceptThread != null) acceptThread.cancel();
-        if (connectThread != null) connectThread.cancel();
-        if (connectedThread != null) connectedThread.cancel();
+        try { if (bt != null && bt.isDiscovering()) bt.cancelDiscovery(); }
+        catch (Exception e) { /* done */ }
+        synchronized (this) {
+            if (acceptThread != null) { acceptThread.cancel(); acceptThread = null; }
+            if (connectThread != null) { connectThread.cancel(); connectThread = null; }
+            for (ConnectedThread t : peers.values()) t.cancel();
+            peers.clear();
+            peerNames.clear();
+        }
     }
 }
